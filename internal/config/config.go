@@ -15,6 +15,7 @@ type Config struct {
 	ProcessTickMs        int
 	TargetMoistPct       float64
 	MaxGradientDeltaPct  float64
+	MoistureTolerancePct float64
 	DryingRampMinutes    int
 	DryRampSteps         int
 	SegmentVentSteps     int
@@ -26,7 +27,8 @@ func Default() Config {
 		TowerID: "tower-a1", ZoneCount: 6, DefaultAirflowCMH: 850.0, AirflowTolerancePct: 5,
 		EqualizeHoldMinutes: 1, FanMinRun: time.Millisecond, FanCoast: time.Second,
 		PlenumPrimeSec: 5, AlarmBufferSize: 64, ProcessTickMs: 10,
-		TargetMoistPct: 14.0, MaxGradientDeltaPct: 2.5, DryingRampMinutes: 2,
+		TargetMoistPct: 14.0, MaxGradientDeltaPct: 2.5, MoistureTolerancePct: 0.5,
+		DryingRampMinutes: 2,
 		DryRampSteps: 40, SegmentVentSteps: 60, AvgTempWindowMinutes: 2,
 	}
 }

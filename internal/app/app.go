@@ -124,9 +124,33 @@ func New(cfg config.Config) (*App, error) {
 
 func (a *App) onTowerTransition(ctx context.Context, tower model.TowerID, from, to model.TowerState) error {
 	if to == model.TowerFault {
+		// 出口含水率飘出容差带触发的故障，回执须带含水偏离语义标签，
+		// 供调度端经 errors.Is(err, model.ErrMoistureDrift) 走含水偏离处置分支；
+		// 仅当非含水原因时才回执风机故障。
+		if a.moistureDrifted() {
+			return model.Wrap("app", "tower_fault", model.ErrMoistureDrift)
+		}
 		return model.Wrap("app", "tower_fault", model.ErrFanFault)
 	}
 	return nil
+}
+
+// moistureDrifted reports whether any zone reading has drifted outside the
+// target moisture tolerance band. It is the criterion that distinguishes a
+// moisture-driven tower fault from a fan-driven one inside the fault receipt.
+func (a *App) moistureDrifted() bool {
+	tol := a.cfg.MoistureTolerancePct
+	if tol < 0 {
+		tol = 0
+	}
+	lo := a.cfg.TargetMoistPct - tol
+	hi := a.cfg.TargetMoistPct + tol
+	for _, r := range a.plant.SensorReadings() {
+		if r.Pct < lo || r.Pct > hi {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) onDryTransition(ctx context.Context, tower model.TowerID, from, to model.DryState) error {
@@ -201,7 +225,7 @@ func (a *App) RunOnce(ctx context.Context) error {
 			return err
 		}
 	}
-	if a.plant.AtTarget(0.5) {
+	if a.plant.AtTarget(a.cfg.MoistureTolerancePct) {
 		if err := a.towerFSM.Apply(ctx, "target_reached"); err != nil {
 			return err
 		}
