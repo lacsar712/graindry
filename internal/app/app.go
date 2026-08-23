@@ -8,6 +8,7 @@ import (
 	"github.com/lacsar712/graindry/internal/airflow"
 	"github.com/lacsar712/graindry/internal/clock"
 	"github.com/lacsar712/graindry/internal/config"
+	"github.com/lacsar712/graindry/internal/dehumid"
 	"github.com/lacsar712/graindry/internal/dryer"
 	"github.com/lacsar712/graindry/internal/fsm"
 	"github.com/lacsar712/graindry/internal/interlock"
@@ -17,17 +18,24 @@ import (
 )
 
 type App struct {
-	cfg      config.Config
-	clk      clock.Clock
-	mem      *store.Memory
-	sched    *store.ScheduleStore
-	plant    *dryer.TowerPlant
-	towerFSM *fsm.TowerFSM
-	zones    *dryer.ZoneTable
-	lock     *interlock.DamperLock
-	dampers  *airflow.DamperActuator
-	router   *airflow.Router
-	guard    *interlock.Guard
+	cfg          config.Config
+	clk          clock.Clock
+	mem          *store.Memory
+	sched        *store.ScheduleStore
+	plant        *dryer.TowerPlant
+	towerFSM     *fsm.TowerFSM
+	zones        *dryer.ZoneTable
+	lock         *interlock.DamperLock
+	dampers      *airflow.DamperActuator
+	router       *airflow.Router
+	routePlanner *airflow.RoutePlanner
+	zoneFlows    *airflow.ZoneFlowTable
+	stager       *airflow.Stager
+	dehumid      *dehumid.Controller
+	holdMgr      *moisture.HoldWindowManager
+	holdEval     *moisture.HoldWindowEvaluator
+	gradAudit    *moisture.OrderedGradientValidator
+	guard        *interlock.Guard
 }
 
 func New(cfg config.Config) (*App, error) {
@@ -51,6 +59,7 @@ func New(cfg config.Config) (*App, error) {
 	plant.BindAirflow(plenumID, model.AirflowSetpoint{CubicMetersPerHour: cfg.DefaultAirflowCMH, TolerancePct: cfg.AirflowTolerancePct})
 	fan := airflow.NewFan(model.FanID("fan-1"))
 	plant.Fans().Add(fan)
+	plant.Plenums().Add(airflow.NewPlenum("plenum-alt", 900))
 	guardPairs := make(map[model.ZoneID]model.PlenumID)
 	zoneIDs := make([]model.ZoneID, 0, cfg.ZoneCount)
 	targets := make([]float64, 0, cfg.ZoneCount)
@@ -64,14 +73,33 @@ func New(cfg config.Config) (*App, error) {
 	if err := plant.InitProfile(zoneIDs, targets); err != nil {
 		return nil, err
 	}
+	ventBank, err := dehumid.NewVentBank(zoneIDs, "vent-damper")
+	if err != nil {
+		return nil, err
+	}
+	router := airflow.NewRouter([]model.PlenumRoute{
+		{From: plenumID, To: "plenum-alt", Damper: "damper-main", Priority: 10},
+	})
+	holdMgr := moisture.NewHoldWindowManager()
 	a := &App{
 		cfg: cfg, clk: clk, mem: mem, sched: store.NewScheduleStore(mem), plant: plant, zones: zones,
-		lock: interlock.NewDamperLock(clk.Now),
-		router: airflow.NewRouter([]model.PlenumRoute{{From: plenumID, To: "plenum-alt", Damper: "damper-main", Priority: 10}}),
-		guard: interlock.NewGuard(guardPairs),
+		lock: interlock.NewDamperLock(clk.Now), router: router,
+		routePlanner: airflow.NewRoutePlanner(router, plant.Plenums()),
+		zoneFlows:    airflow.NewZoneFlowTable(),
+		stager:       airflow.NewStager(plant.Fans(), clk),
+		holdMgr:      holdMgr,
+		holdEval:     initHoldEvaluator(plant.Profile(), holdMgr),
+		gradAudit:    moisture.NewOrderedGradientValidator(zoneIDs, cfg.MaxGradientDeltaPct, 0.5),
+		guard:        interlock.NewGuard(guardPairs),
 	}
+	a.dehumid = initDehumidController(ventBank, cfg.MaxGradientDeltaPct, func(readings []model.MoistureReading) float64 {
+		return plant.GradientDeltaFor(readings)
+	})
 	a.dampers = airflow.NewDamperActuator(a.lock)
 	a.dampers.Register(airflow.NewDamper("damper-main"))
+	for _, vent := range ventBank.All() {
+		a.dampers.Register(airflow.NewDamper(vent.Damper))
+	}
 	a.towerFSM = fsm.NewTowerFSM(towerID, a.onTowerTransition)
 	a.persistSnapshot(towerID)
 	return a, nil
@@ -113,7 +141,7 @@ func (a *App) RunOnce(ctx context.Context) error {
 		return err
 	}
 	plenum := model.PlenumID("plenum-main")
-	if err := a.plant.PrimePlenum(ctx, plenum); err != nil {
+	if err := a.primeAndRoute(ctx, plenum); err != nil {
 		return err
 	}
 	if err := a.dampers.Move(ctx, "damper-main", 100); err != nil {
@@ -122,34 +150,27 @@ func (a *App) RunOnce(ctx context.Context) error {
 	if err := a.towerFSM.Apply(ctx, "airflow_ok"); err != nil {
 		return err
 	}
-	if err := a.plant.Coordinator().Start(ctx, model.FanID("fan-1")); err != nil {
+	if err := a.stageFans(ctx); err != nil {
 		return err
 	}
 	a.plant.ObserveFlow(plenum, a.cfg.DefaultAirflowCMH)
 	if err := a.plant.ValidateFlows(ctx); err != nil {
 		return err
 	}
-	for i, z := range a.zones.Zones() {
-		moist := 18.0 - float64(i)*0.3
-		if err := a.plant.ObserveMoisture(z.Zone, moist); err != nil {
-			return err
-		}
-		a.zones.UpdateMoisture(z.Zone, moist)
-	}
-	if err := a.plant.ValidateGradient(); err != nil {
+	if err := a.observeZoneMoisture(ctx); err != nil {
 		return err
 	}
 	a.plant.ArmMoistureHold(a.clk.Now(), time.Duration(a.cfg.EqualizeHoldMinutes)*time.Minute, a.cfg.TargetMoistPct)
-	if err := a.towerFSM.Apply(ctx, "moisture_hold"); err != nil {
+	if err := a.runHoldWindow(ctx); err != nil {
 		return err
 	}
 	if pc, ok := a.clk.(*clock.ProcessClock); ok {
 		pc.Advance(time.Duration(a.cfg.EqualizeHoldMinutes)*time.Minute + time.Second)
 	}
-	if err := a.towerFSM.Apply(ctx, "release_hold"); err != nil {
+	if err := a.releaseHoldWindow(ctx); err != nil {
 		return err
 	}
-	a.plant.ReleaseHold()
+	a.sealDehumidVents()
 	for _, z := range a.zones.Zones() {
 		if err := a.plant.ObserveMoisture(z.Zone, a.cfg.TargetMoistPct); err != nil {
 			return err
@@ -173,6 +194,8 @@ func (a *App) RunOnce(ctx context.Context) error {
 }
 
 func (a *App) StatusLine() string {
-	return fmt.Sprintf("tower=%s state=%s hold=%v zones=%d gradient=%.2f",
-		a.cfg.TowerID, a.towerFSM.State(), a.plant.HoldActive(), a.zones.EnabledCount(), a.plant.GradientDelta())
+	plenum := model.PlenumID("plenum-main")
+	return fmt.Sprintf("tower=%s state=%s hold=%v zones=%d gradient=%.2f %s %s audit=%v",
+		a.cfg.TowerID, a.towerFSM.State(), a.plant.HoldActive(), a.zones.EnabledCount(),
+		a.plant.GradientDelta(), a.routeSummaryLine(plenum), a.holdWindowStatus(), a.gradientAuditClean())
 }

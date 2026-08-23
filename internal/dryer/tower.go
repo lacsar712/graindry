@@ -179,3 +179,22 @@ func (p *TowerPlant) AtTarget(tolerance float64) bool {
 func (p *TowerPlant) GradientDelta() float64 {
 	return p.gradient.Delta(p.sensors.Readings())
 }
+
+func (p *TowerPlant) GradientDeltaFor(readings []model.MoistureReading) float64 {
+	return p.gradient.Delta(readings)
+}
+
+func (p *TowerPlant) SensorReadings() []model.MoistureReading {
+	return p.sensors.Readings()
+}
+
+func (p *TowerPlant) Profile() *moisture.ProfileManager {
+	return p.profile
+}
+
+func (p *TowerPlant) HoldDuration() time.Duration {
+	if p.holdDur > 0 {
+		return p.holdDur
+	}
+	return time.Minute
+}
