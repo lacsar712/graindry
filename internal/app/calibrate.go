@@ -17,11 +17,13 @@ func (a *App) CalibrateFeed(ctx context.Context, tower model.TowerID, holder str
 	if err := a.feedLeases.Require(tower, holder, 30*time.Second); err != nil {
 		return err
 	}
+	// Release on every return path so a failed self-diagnostic cannot strand
+	// the feed-door lease and block the next shift from opening the feed door.
+	defer a.feedLeases.ReleaseHolder(tower, holder)
 	if CalibrateProbe != nil {
 		if err := CalibrateProbe(ctx); err != nil {
 			return fmt.Errorf("calibrate: %w", err)
 		}
 	}
-	a.feedLeases.ReleaseHolder(tower, holder)
 	return nil
 }
