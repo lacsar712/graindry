@@ -19,7 +19,7 @@ func NewAvgTempWindow(clk Clock, duration time.Duration) *AvgTempWindow {
 }
 
 func (w *AvgTempWindow) Active(anchor time.Time) bool {
-	return time.Since(anchor) < w.duration
+	return w.clk.Now().Sub(anchor) < w.duration
 }
 
 func (w *AvgTempWindow) Require(anchor time.Time) error {
