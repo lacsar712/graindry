@@ -51,6 +51,9 @@ func (c *Coordinator) RampTo(ctx context.Context, fan model.FanID, targetPct flo
 	cur := f.Speed()
 	delta := (targetPct - cur) / float64(steps)
 	for i := 0; i < steps; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		cur += delta
 		f.SetSpeed(cur)
 		if pc, ok := c.clk.(*clock.ProcessClock); ok {
