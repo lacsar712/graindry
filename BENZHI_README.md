@@ -1,6 +1,6 @@
-# HookRelay
+# graindry
 
-Signed ingress + reliable outbound webhook delivery (retry, circuit breaker, rate limit, DLQ, replay).
+graindry 是一套工业粮食干燥塔工业过程控制系统，用于区段含水梯度、风门配风与塔级状态联锁。
 
 ## Requirements
 
